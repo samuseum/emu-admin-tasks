@@ -1,0 +1,797 @@
+#!/bin/bash
+##############################################################
+#
+# Audit report generator for the South Australian Museum
+#
+# Note that this report takes quite some time to run as it involves a
+# number of long-running texql queries
+
+#############
+# Overview
+#############
+
+# This file generates a pdf report and a Groups Module record in EMu
+# listing a random selection of catalogue records from a specified
+# collection so that they can be audited, to ensure that the Museum
+# meets its auditing requirements.
+#
+# This script is added as an Admin task to EMu, allowing it to be run
+# by an admin user for any specified collection.
+
+# This script takes the name of a collection as a parameter. Then a
+# groff tempfile is generated using the text in this file along with a
+# series of texql queries. The tempfile is then run through pdfmom,
+# which is part of groff. This produces a pdf output which can be used
+# for performing the audit. If groff is not present on your system it
+# can be installed with (for Debian based systems)
+#
+# sudo apt install groff groff-base
+#
+# Finally a group is created in the egroups module with a list of all
+# the records in the report, to allow for alternative reporting and
+# bulk updates.
+#
+# If you are only interested in creating the group and don't need a pdf
+# report you can safely remove the entire pdf section. 
+
+
+
+#############
+# Getting report working on EMu server
+#############
+
+# This report should be saved on the EMu server in the admin folder.
+#
+# Then a registry entry should be created:
+#
+# Group|default|Table|eadmin|Admin Task|Audit Report|
+# {Launch Temp %1}audit_report [text: Enter Collection Name in "quotes"]
+# 
+# This will save the output file to the client computer at
+#
+# %AppData%/Local/Temp
+#
+# and launch it in a pdf viewer.
+
+# It is recommended that the pdf report be saved as a multimedia
+# attachment to the groups record
+
+###
+#
+# Current problems with pdf report - to be fixed
+# 
+# - Until these are fixed deal with them by just running the task again,
+#   but remember to delete the group that the false run created
+#
+# 1. Occasionally something goes awry with the tbl preprocessing
+#    and the pdf generation fails. 
+# 2. Occasionally the page-count of the preliminary run gets a
+#    different page total to the final output so the page total
+#    e.g. "page 3 of 7" doesn't have the correct total. Check by
+#    going to the last page in the report and confirming that it's right
+#    ("page 27 of 27" or something like that)
+#
+###
+
+###############################
+# Constants
+###############################
+
+number_to_be_sampled=100
+
+high_monetary_amount=5000
+types_percent=30
+max_types=200
+
+today=$(date +'%Y/%m/%d')
+six_months_from_today=$(date +'%Y/%m/%d' -d'6 months')
+recently_checked_date=$(date +'%Y/%m/%d' -d'3 years ago')
+
+today_for_filename=$(date +'%Y-%m-%d')
+
+#
+# These admin usernames get added to the values in the group created
+# at the very end. Separated out here for easy changing
+#
+admin_user_id="keithm"
+admin_username="Keith Maguire"
+
+##############################################################
+#
+# Get Collection Name to be reported on
+#
+##############################################################
+
+#
+# Take the collection name from the argument passed to this script
+#
+
+collection=$1
+
+#
+# It's much faster to get the current list of collection names from
+# the lookup list rather than the catalogue records.
+#
+# Confirm that the lookup name is correct from the field help in EMU
+# (i.e. press f1 when the cursor is in the Collection Name field in
+# the catalogue)
+#
+
+collection_name_lookup_name="Collection Name"
+
+collection_name_query="select Value000 from eluts where NameText =
+		   '$collection_name_lookup_name'"
+
+current_collection_names_string=$(texql -R <<< "$collection_name_query" |
+				      cut -d "'" -f 2 )
+#
+# The collection names are now in a multi-line string, so we put them
+# into an array so we can iterate over it.
+#
+# This is done using 'readarray -t' : the '-t' trims any newlines from
+# the end of the string, otherwise the comparison with the collection
+# passed as an argument will always fail.
+#
+
+readarray -t current_collection_names < <(
+    echo "$current_collection_names_string")
+
+#
+# Confirm that the collection selected is a valid collection name
+#
+
+found=false
+for i in "${current_collection_names[@]}"
+do
+    if [ "$i" == "$collection" ] ; then
+	found=true
+    fi
+done
+
+if [ "$found" = false ]
+then
+    echo "'$1' is not a valid collection name (test is case sensitive)"
+    exit 1
+fi
+
+###############******
+#
+# If you're not producing pdf output you can remove this bit
+
+#
+# Create a tempfile which will get passed to groff
+# The trap removes the tempfile when this script exits
+#
+
+tempfile=$(mktemp)
+trap "rm -f $tempfile" EXIT
+
+#
+# End of bit that can be safely removed
+###############******
+
+#############
+#
+# Queries - quantity
+#
+#############
+
+# 
+# These queries only get the irns so that a more detailed query can be
+# run on the required subset of the collection.
+#
+# The queries are separated out up here to make it clear what is meant
+# by the different queries and to allow for more convenient editing.
+#
+# Note that types are excluded from the High-value items query as they
+# are already considered as part of the Types query. As the general
+# collection query is a random sample it may very well include records
+# that also occur in the other classes of item.
+#
+
+collection_irns_query="select irn from ecatalogue 
+			      where exists (CatCollectionName_tab where 
+			      (CatCollectionName = '$collection'))
+			      and
+			      (DeaDeaccessionDate is Null)
+			      and
+			      ((SecRecordStatus = 'Active') 
+			      or (SecRecordStatus is Null))"
+
+high_monetary_query="$collection_irns_query
+ 			      and 
+ 			      (ValValuationAmount > $high_monetary_amount)
+			      and
+			      (CitTypeStatus_tab = [])"
+
+types_query="$collection_irns_query
+ 			    and 
+			    (not ( CitTypeStatus_tab = [] ))
+			    and 
+			    (not exists 
+			    (StaInventoryDate0
+			    where (StaInventoryDate > DATE '$recently_checked_date')))"
+
+# high_bio_risk_query="$collection_irns_query
+# 				and
+# 				[THIS FIELD DOESN'T EXIST YET]"
+
+###############################
+#
+# Quantities queries
+#
+###############################
+#
+# These queries get only the irns. The irns are then stuck together
+# into a string that can be used for a texql query which will be used
+# in subsequent queries to get the details.
+#
+# Note that the count queries will still return 1 for no results as
+# `echo "" | wc -l` returns 1
+#
+
+irn_search_replace=" or irn = "
+irn_group_replace="|"
+
+#########
+#
+# Random sample from across entire collection
+#
+#########
+
+# All items in the collection
+collection_irns=$(texql -R <<< "$collection_irns_query" | tr -d '()')
+total_irns=$(echo "$collection_irns" | wc -l)
+
+# Number to be sampled
+#
+# Specified in number_to_be_sampled in the constants section.
+#
+# If you want to do a percent sample instead of a specific number:
+# Bash arithmetic only works with integers so can't just multiply by,
+# e.g. 0.3 so using thousanths instead of percent. Add a constant at
+# the start of the report for thousanths_to_be_sampled to make editing
+# easier:
+#
+# number_to_be_sampled=$(( total_irns * thousanths_to_be_sampled / 1000 ))
+# if (( number_to_be_sampled < 100 ))
+# then
+#     number_to_be_sampled=100
+# fi
+
+sampled_irns=$( echo "$collection_irns" |
+			       shuf -n "$number_to_be_sampled")
+
+#
+# putting the irns into a string joined by ' or ' so they can be used
+# to create a texql query like
+#
+# 'select SummaryData from ecatalogue where (irn = 1 or irn = 2 [...])'
+#
+
+sampled_irns_string="${sampled_irns//$'\n'/$irn_search_replace}"
+
+#
+# At the end of this process, a list of irns are used to create a
+# group. The command requires the irns in the format:
+# '1234|234521|42332'
+#
+# If there are other records to be added to the list they will be
+# appended onto the end of this string
+
+irns_for_group="${sampled_irns//$'\n'/$irn_group_replace}"
+
+#########
+#
+# High value items
+#
+#########
+
+#
+# This texql query gives the list of irns in a column enclosed in
+# parentheses. tr -d '()' removes the parentheses from each line
+# 
+
+high_monetary_irns=$(texql -R <<< "$high_monetary_query" | tr -d '()')
+
+if [ -z "$high_monetary_irns" ]
+then
+    : # No items valued over \$5,000 recorded in the $collection Collection
+else
+
+    total_high_monetary_irns=$(echo "$high_monetary_irns" |
+				wc -l)
+    
+    high_monetary_irns_string="${high_monetary_irns//$'\n'/$irn_search_replace}"
+    high_monetary_irns_for_group="${high_monetary_irns//$'\n'/$irn_group_replace}"
+    
+    irns_for_group="${irns_for_group}|${high_monetary_irns_for_group}"
+
+fi
+
+#########
+#
+# Type specimens
+#
+#########
+
+types_irns=$(texql -R <<< "$types_query" | tr -d '()')
+total_types_irns=$(echo "$types_irns" | wc -l)
+
+if [ -z "$types_irns" ]
+then
+    : # No type specimens recorded in the $collection Collection
+else
+    # Sampling the specified percent of irns
+    #
+    types_to_be_checked=$(( total_types_irns * types_percent / 100 ))
+    #
+    # As Bash arithmetic only works on integers if there's only a
+    # handful of types this might end up rounding down to zero. In
+    # that case all the types will be checked
+
+    if (( types_to_be_checked < 5 ))
+    then 
+	types_to_be_checked=$total_types_irns
+    fi
+
+    #
+    # Some collections have tens of thousands of types. The maximum
+    # number of types to be checked is therefore limited to a
+    # specified value $max_types
+    #
+   
+    if (( types_to_be_checked > max_types ))
+    then
+	types_to_be_checked=$max_types
+    fi
+    
+    # echo "$types_to_be_checked will be checked"
+    types_irns_sample=$(echo "$types_irns" | shuf -n "$types_to_be_checked")
+    types_irns_string="${types_irns_sample//$'\n'/$irn_search_replace}"
+    types_irns_for_group="${types_irns_sample//$'\n'/$irn_group_replace}"
+    
+    irns_for_group="${irns_for_group}|${types_irns_for_group}"
+fi
+
+#########
+#
+# High Risk Biological Specimens
+#
+#########
+
+#
+# WAITING ON NEW EMU FIELD
+#
+
+# high_risk_bio_irns=$(texql -R <<< $high_risk_bio_query | tr -d '()')
+# total_high_risk_bio_irns=$(echo "$high_risk_bio_irns" | wc -l)
+
+# if [ -z "$high_risk_bio_irns" ]
+# then
+#     : # no 'High Risk Biological' specimens in the $collection Collection
+# else
+#     echo "$total_high_risk_bio_irns high scientific value items present"
+#     # All high-risk-bio-value items to be checked every year
+#     high_risk_bio_to_be_checked=$((\
+# 				   total_high_risk_bio_irns\
+# 				       * high_risk_bio_percent / 100 ))
+#     high_risk_bio_irns_string="${high_risk_bio_to_be_checked//$'\n'/$irn_search_replace}"
+#     high_risk_bio_irns_for_group="${high_risk_bio_to_be_checked//$'\n'/$irn_group_replace}"
+#     irns_for_group="${irns_for_group}|${high_risk_bio_irns_for_group}"
+# fi
+
+##############################################################
+#  *********************************************************
+#
+# Start pdf report file
+#
+##############################################################
+
+#
+# Generate Groff file using the mom macro set.
+# For documentation on the macro set see:
+# https://www.schaffter.ca/mom/momdoc/toc.html
+#
+
+#
+# All text directly writted to the groff file is done as
+# heredocs. This makes them easier to spot when scrolling through this
+# file in an editor.
+# 
+
+#
+# Start and introduction
+#
+
+cat << EOF > "$tempfile"
+.TITLE "South Australian Museum" "Audit report: $collection"
+.SUBTITLE "Report generated on $today" "Report to be completed by $six_months_from_today"
+.PAPER A4
+.PRINTSTYLE TYPESET
+.L_MARGIN .5i
+.R_MARGIN .5i
+.SMARTQUOTES OFF
+.DOCHEADER_LEAD +2
+.HEADER_LEFT "Page \*[PAGE#] of \n[pages]"
+.PAGINATE OFF
+.PT_SIZE 12
+.SS	 0
+.PARA_INDENT 0
+.PARA_SPACE
+
+.START
+.HEADING 1 "Overview"
+.PP
+See the Museum's Audit policy and procedure for how to complete this audit.
+EOF
+
+#
+# High value items, if any recorded in collection
+#
+
+if [ -z "$high_monetary_irns" ]
+then
+    :
+else
+    cat << EOF >> "$tempfile"
+.PP
+.FONT B
+High Value Items
+.FONT R
+.PP
+The $collection contains $total_high_monetary_irns items which have
+been valued at \$$high_monetary_amount or more. All high value items
+are to be audited each year. 
+EOF
+
+fi
+
+#
+# Type specimens
+#
+
+if [ -z "$types_irns" ]
+then
+   :
+else
+    cat << EOF >> "$tempfile"
+.PP
+.FONT B
+Type Specimens
+.FONT R
+.PP
+The $collection collection contains $total_types_irns Type specimens 
+which have not been sighted since $recently_checked_date (i.e. three 
+years before this audit). The collection will audit $types_percent% 
+of the type specimens each year - to a maximum of 200 to be checked 
+annually. These records will be randomly sampled from types which 
+have not been sighted in the last three years. Accordingly for this 
+collection $types_to_be_checked type specimens will be audited this 
+year.
+EOF
+
+fi
+
+#
+# High Scientific value specimens
+#
+
+# if [ -z "$high-scientific_irns" ]
+# then
+#    :
+# else
+#     cat << EOF >> "$tempfile"
+# .PP
+# .FONT B
+# Type Specimens
+# .FONT R
+# .PP
+# The $collection contains $total_types_irns specimens of high scientific
+# value, besides type specimens.
+# .PP
+# The collection will audit all high scientific value items each year.
+# .PT_SIZE 8
+# EOF
+
+# fi
+
+###########
+#
+# Add in General collections
+# and spaces for sign-off
+#
+###########
+
+    cat << EOF >> "$tempfile"
+.PP
+.FONT B
+General Collection
+.FONT R
+.PP
+The $collection collection of the South Australian Museum contains 
+$total_irns items. $number_to_be_sampled items will be sampled at
+random from the general collection to be audited this year.
+.SP
+.ce
+\l'12c'
+.SP
+.PP
+Audit completed on date \l'6c'
+.PP
+.SP
+.PP
+Signed by Collection Manager \l'6c'
+.PP
+Signed by Collections Coordinator \l'6c'
+EOF
+
+############################
+#
+# Insert record lists/tables
+#
+############################
+
+#
+# Queries and filtering
+#
+# Query
+#
+# By default texql encloses strings in a single inverted comma:
+# 'string'. As ' is reasonably common in the data it makes parsing the
+# results unnecessarily tricky
+#
+# texql -t@ encloses strings in @ rather than '. It makes things
+# easier to parse as @ very rarely appears in catalogue records.
+#
+# The query adds in a few '^' to help separate the data out later. '^'
+# very rarely appears in catalogue records.
+#
+# Filtering result strings (using sed)
+#
+# The sed commands tidy the data up into a string with three
+# strings separated by '^'.  When generating the report text these
+# values are separated out using cut.
+#
+# Note that obviously the occurrence of either @ or ^ in the catalogue
+# data will cause problems in the data output. It was judged that
+# those characters occur so rarely that it is easily dealt with.
+#
+# sed -e 's/^.//' -e 's/.$//'
+# removes the parantheses in which texql results are enclosed
+# sed -r -e 's/(^@|@,|@,@|,@|@$)//g'
+# removes the commas as well as the @ specified as string separator
+# sed -e 's/\.NULL//g'
+# removes the '.NULL' from records that don't have a suffix
+#
+function query_and_print {
+    local query_type="$1"
+    local query_irns="$2"
+    
+    cat << EOF >> "$tempfile"
+.NEWPAGE
+.HEADING 1 "$query_type - $collection"
+EOF
+
+    records_query="order(
+			(select '^',CatPrefix,
+				CatRegNumber, 
+				'.',CatSuffix,
+				'^',cat_summary,
+       				'^',loc_summary
+			  from
+			  ((ecatalogue[CatPrefix, 
+			  	       CatRegNumber,
+				       CatSuffix,
+			  	       SummaryData as cat_summary,
+ 				       LocPermanentLocationRef as loc_irn]
+  			   where irn = $query_irns )
+			   join
+			   (elocations[SummaryData as loc_summary,
+			 	     irn as loc_irn]))
+			) union
+			  (ecatalogue['^',CatPrefix, 
+			  	      CatRegNumber, 
+				      '.',CatSuffix, 
+				      '^',SummaryData as cat_summary, 
+				      '^','Not recorded']
+			   where (irn = $query_irns ) 
+			   and LocPermanentLocationRef is NULL)
+		       ) on CatPrefix asc, 
+		       	    CatRegNumber asc, 
+			    CatSuffix asc"
+ 
+    records_data=$(texql -R -t@ <<< "$records_query" |
+			     sed -e 's/^.//' -e 's/.$//'| 
+			     sed -r -e 's/(^@|@,|@,@|,@|@$)//g' |
+			     sed -e 's/\.NULL//g')
+    
+    ####
+    #
+    # Add these records to the report
+    #
+    ####
+
+    #
+    # The tables are formatted using the tbl preprocessor. See 'Tbl -
+    # A Program to Format Tables' available online at various sources
+    # including:
+    # 
+    # http://doc.cat-v.org/unix/v10/10thEdMan/tbl.pdf
+    # 
+    # for example the formatting line ltP10v12w(3) means:
+    # l    Left-adjusted
+    # t    Begin line at top of box
+    # P10  Change point size to 10
+    # v12  Vertical spacing to 12
+    # w(3) Column width 3 ens
+    #
+    # For some reason a header causes the count column to be
+    # excessively wide so there's no header even though it would be
+    # better if there was one
+    
+    cat << EOF >> "$tempfile"
+.TS H 
+allbox;
+ltP10v12w(3) lxP10v12 ltP10v12.
+_
+.TH
+EOF
+
+    count=1
+
+    while IFS= read -r line; do
+	regno=$(echo "$line" | cut -d'^' -f2)
+	cat_summary=$(echo "$line" | cut -d'^' -f3 )
+	trim_cat_summary="${cat_summary//$regno}"
+	location=$(echo "$line" | cut -d'^' -f4)
+	cat << EOF >> "$tempfile"
+$count	T{
+\f[B]$regno\f[R] $trim_cat_summary
+T}	Sighted - Date - Remarks
+\^	T{
+\f[B]Location:\f[R] $location
+T}	\^
+EOF
+	((count++))
+	
+    done <<< "$records_data"
+    
+    cat << EOF >> "$tempfile"
+.TE
+
+EOF
+}
+
+###########
+#
+# High-value items
+#
+###########
+
+if [ -z "$high_monetary_irns" ]
+then
+    : # There are no items recorded with a value of > \$5,000 in the
+      # $collection
+else
+    : # Generating pdf file - high-value items table
+    query_and_print "High-value items" "$high_monetary_irns_string"
+fi
+
+###########
+#
+# Type specimens
+#
+###########
+
+if [ -z "$types_irns" ]
+then
+    : # There are no type specimens recorded in the $collection Collection
+else
+    query_and_print "Type specimens" "$types_irns_string"
+fi
+
+###########
+#
+# High risk biological specimens
+#
+###########
+
+# if [ -z "$types_irns" ]
+# then
+#     : There are no high risk biological specimens recorded in the $collection Collection
+# else
+#     query_and_print "High Risk Biological specimens" "$high_risk_bio_irns_string"
+# fi
+
+
+###########
+#
+# Sampled records
+#
+###########
+
+query_and_print "General collection items" "$sampled_irns_string"
+
+###########
+#
+# Generate the pdf file
+#
+###########
+
+outputfile="${collection}_audit_report_${today_for_filename}.pdf"
+
+# Gets the total pages so the page number can be like "1 of 7"
+# groff:
+# .tm   - output the bit after it to stderr
+# \n[%] - the page number
+# -z  - stop any output files from being generated
+# -i  - reads the stdin at the end
+# bash: 2>&1 redirects stderr to stdout
+
+# This all combined to give a page count.
+
+PAGE_COUNT=$(echo ".tm \n[%]" |
+		 pdfmom -K UTF-8 -t -i -z -mom "$tempfile" 2>&1 | tail -n 1)
+
+#
+# Actually generate the file
+#
+
+pdfmom -K UTF-8 -t -rpages=$PAGE_COUNT -mom "$tempfile" > "$outputfile"
+
+#
+# The generated filename needs to be output by the script to get EMu
+# to open it up in a PDF viewer after the task runs
+#
+
+echo $outputfile
+
+#
+# End of pdf report generation
+#
+#  *********************************************************
+##############################################################
+
+##############################################################
+#
+# Generate Audit Groups Module record so that audit can also be
+# recorded in the database
+#
+##############################################################
+
+# Create an egroups record containing the list of items in this report
+# This command makes a group that is accessible by anyone but only
+# editable or deletable by the admin user
+#
+# Note the format of the insert command, the values are in the same
+# order as the column names and table rows are enclosed in [].
+# table values must separated with a bar '|' - which is how the irns
+# were joined in the creation of $irns_for_group
+#
+# By default everyone can look at the audit reports but only the admin
+# group can edit or delete them. I also added the admin user (me) by
+# name to err on the side of caution.
+#
+group_creation_command="insert into egroups[GroupName,
+ 		    	       GroupDescription,
+ 		    	       UserId,
+ 		    	       UserName,
+ 		    	       GroupType,
+ 		    	       Module,
+ 		    	       Keys_tab,
+ 		    	       SecCanEdit_tab,
+ 		    	       SecCanDisplay_tab,
+ 		   	       SecCanDelete_tab]
+ 			       values ['Audit group for $collection',
+ 			       'The Audit group created for the $collection collection on $today',
+ 			       '$admin_user_id',
+ 			       '$admin_username',
+ 			       'Static',
+ 			       'ecatalogue',
+ 			       [$irns_for_group],
+ 			       ['Group Admin'],
+ 			       ['Group Default'],
+ 			       ['Group Admin']]"
+texql <<< "$group_creation_command"
+

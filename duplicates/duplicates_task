@@ -1,0 +1,167 @@
+#!/bin/bash
+
+##################################################################
+#
+# Duplicate spotter for the South Australian Museum
+#
+
+#############
+# Overview
+#############
+#
+# This admin task can be used to assist with cleaning up data by showing
+# what may be duplicate records.
+#
+# This task searches EMu in the specified table in the specified columns
+# and returns values which appear more than the specified number of
+# times.
+#
+# What?
+#
+# Examples:
+#
+# If you search 'eparties 5 SummaryData' you'll get a list of all
+# the Summary Datas that appear more than five time in the Parties module.
+#
+# If you search 'ecollectionevents 3 LocCountry
+# LocProvinceStateTerritory LocTownship LocNearestNamedPlace
+# LocPreciseLocation' you'll get a list of all the times where the
+# combination of country, state, township, nearest named place and
+# precise location occur more than three times. This might be useful
+# for spotting records for the same location which have wrongly been
+# given different coordinates (note that the coordinates weren't part
+# of the search)
+
+# The outputs of this task should always be considered as a guide only
+
+#
+# You still need to verify that records which occur with those fields
+# duplicated should indeed be considered duplicate records - they may
+# be duplicates when you consider only those fields but not be so when
+# you consider more of the fields. Places with identical textual
+# descriptions may have valid reasons to have different
+# coordinates. Or they may have a different depth recorded in yet
+# another field.
+#
+
+#############
+# Getting report working on EMu server
+#############
+
+# This report should be saved on the EMu server in the admin folder.
+#
+# Then a registry entry should be created (edit this to fit on a single
+# line, it's broken up here purely for legibility):
+#
+# Group|default|Table|eadmin|Admin Task|Duplicates Report|
+# admin-task-duplicates.sh
+#       [text: Module (Back-end name)]
+#       [number: Number ( occurrences of fields > Number is returned.
+#           Default is 1 ]
+#       [text: Fields (List of fields separated with a space.
+#           Default is only SummaryData)]
+#
+# The output will be displayed in the admin report viewer
+
+
+###############################
+# Constants
+###############################
+
+maxnotreturned="1"
+validtables="ecatalogue eparties ecollectionevents etaxonomy"
+
+#
+# short function to iterate through a list
+#
+
+listcontains() {
+	for term in $1; do
+	[[ $term = $2 ]] && return 0
+	done
+	return 1
+}
+
+# The first argument passed must be a valid table. This is the table
+# to be searched
+
+if listcontains "$validtables" "$1" 
+then
+    table=$1
+
+    shift
+
+    # Check if the next argument is an integer. If it is then it is used
+    # as the number of occurrences above which an occurrence is considered
+    # a duplicate
+    
+    if [[ $# -ne 0 ]]
+    then
+       if (( $1 > 0 )) 
+       then
+	   # $1 is an integer
+	   maxnotreturned=$1
+	   shift
+       fi
+    fi
+    if [[ $# -eq 0 ]]
+    then
+	# No fields were passed, only summarydata will be used"
+	columns="SummaryData"
+    else
+	# The rest of the arguments will be used as the columns
+	columns=$@
+    fi
+else
+    # The first argument passed to the task was not a valid table
+    exit 1
+fi
+
+#####################################
+# Build up the texql query
+#####################################
+
+i=1
+
+arr=($columns)
+for word in $columns
+    
+do
+if [ $i -eq ${#arr[@]} ]; then
+        query+="$word"
+else
+        query+="$word, "
+fi
+        i=$[$i+1]
+done
+
+#####################################
+# run the texql query
+#####################################
+
+
+result=$(texql -R << EOF
+select count(record), $query
+from
+(
+        nest
+        (
+                select $query from $table
+        )
+        on $query
+        forming record
+)
+where count(record) > $maxnotreturned;
+EOF
+      )
+
+trimmed_result=$(echo "$result" | rev | cut -c2- | rev | cut -c2- )
+
+#####################################
+# Output the result
+#####################################
+#
+# The admin task results box displays whatever is sent to stdout by
+# the admin task so the results just need to be output with echo
+echo "number-of-duplicates, $query"
+echo "$trimmed_result"
